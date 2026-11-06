@@ -113,8 +113,8 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
         name="weather_field_scores",
         protocol="grid_valid_time",
         description=(
-            "确定性连续量检验：RMSE / ACC / 预报活跃度 / 纬向谱 / 球谐带功率\n"
-            "  用途  四个角度：误差量级、距平空间型、平滑程度、能量谱分布\n"
+            "确定性连续量检验：RMSE / Bias / ACC / 预报活跃度 / 纬向谱 / 球谐带功率\n"
+            "  用途  误差量级、系统偏差、距平空间型、平滑程度、能量谱分布\n"
             "  数据  预报 格点预报（如 z500）/ 观测 格点实况（如 era5_zarr、CRA40）\n"
             "        参考 气候态 —— ACC / 活跃度必需，纬向谱不需要\n"
             "        单位跟着数据源的 layout 走：*_phys 保持 m²/s²，\n"
@@ -122,7 +122,7 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "  计算  grid_valid_time：格点有效时刻配对；集合先取平均\n"
             "        缺气候态：ACC 用零场兜底、状态标 partial 且结果无意义；\n"
             "        活跃度是距平统计，直接报错（不是静默出假数）\n"
-            "  指标  rmse、acc、activity、zonal_spectrum、spherical_bands\n"
+            "  指标  rmse、bias、acc、activity、zonal_spectrum、spherical_bands\n"
             "        （max_k 由 metric_options 给，默认 30；老仓对每个带\n"
             "        spectrum 的变量同时出 spherical_bands_<var>.csv，这里同口径）\n"
             "        产出 scores.csv、diagnostics/spectrum_{var}.csv（全体均值曲线）、\n"
@@ -135,6 +135,8 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             MetricSpec("activity"),
             MetricSpec("zonal_spectrum"),
             MetricSpec("spherical_bands"),
+            # 放在末尾：不移动既有指标的运行序号，旧 .states 的键位不跟着错位
+            MetricSpec("bias"),
         ],
         writers=["csv_long", "spectrum"],
         options={"ensemble_reduction": "mean"},
