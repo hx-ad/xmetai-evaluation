@@ -1,0 +1,111 @@
+# 把 WB2 6h 气候态 zarr 转成 v2 daily_climatology 用的单文件 nc。
+#
+# 输入: /workspace/data/shenzw/wb2/climatology/era5_1990_2020_6h_mean.zarr (53G)
+# 输出: /workspace/data/shenzw/wb2/eval_clim/era5_clim_phys_wb2.nc (~50G)
+#
+# 只写 11 个变量: z500 t700 t850 q700 u850 v850 u10m v10m t2m msl tp
+# 单位换算: q700 kg/kg -> g/kg (×1000), tp m -> mm/6h (×1000)
+# 源 zarr 已含 WB2 的 61 天 dayofyear 平滑，v2 侧配置必须 smooth_days=0。
+#
+# 提交前先跑 ~/xay-sync.sh，把 tools/build_wb2_clim_nc.py 同步到服务器。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: &job_name szw-wb2-eval-clim
+  namespace: bktk8bmh-default
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 60000000
+  completionMode: NonIndexed
+  completions: 1
+  parallelism: 1
+  suspend: false
+  template:
+    metadata:
+      annotations:
+        bingomatrix.bingosoft.net/ai-device-type: container0:Device,
+        bingomatrix.bingosoft.net/isRDMAHostModel: "true"
+        bingomatrix.bingosoft.net/vgpu-model-to-use: '[NVIDIA H100 80GB HBM3]'
+        bingomatrix.bingosoft.net/vgpu-type: full
+      labels:
+        job-name: *job_name
+    spec:
+      containers:
+      - name: container0
+        image: registry.bingosoft.net/pytorch/pytorch:2.11.0-cuda12.8-mamba3-20260403
+        imagePullPolicy: IfNotPresent
+        command:
+          - "bash"
+          - "-c"
+        args:
+          - |
+            set -u
+            export PYTHONIOENCODING=utf-8
+            export PYTHONUNBUFFERED=1
+
+            REPO=/workspace/szwCode/xmetai-evalation-v2
+            SCRIPT=$REPO/tools/build_wb2_clim_nc.py
+            IN=/workspace/data/shenzw/wb2/climatology/era5_1990_2020_6h_mean.zarr
+            OUT=/workspace/data/shenzw/wb2/eval_clim/era5_clim_phys_wb2.nc
+            LOG=/workspace/data/shenzw/wb2/eval_clim/build.log
+
+            mkdir -p "$(dirname "$OUT")"
+            echo "==== boot $(date '+%F %T') user=$(whoami 2>&1) host=$(hostname 2>&1) ===="
+            exec > >(tee -a "$LOG") 2>&1
+
+            test -f "$SCRIPT" || { echo "FAIL: 缺 $SCRIPT（先跑 ~/xay-sync.sh）"; exit 1; }
+            test -d "$IN" || { echo "FAIL: 缺输入 zarr $IN"; exit 1; }
+
+            if ! python3 -c "import xarray, zarr, netCDF4" 2>/dev/null; then
+              echo "缺依赖，尝试从离线 wheels 安装 xarray/zarr（netCDF4 需镜像自带）"
+              pip install --break-system-packages --no-index \
+                --find-links=/workspace/szwCode/wheels xarray zarr || true
+            fi
+            python3 -c "import xarray, zarr, netCDF4; print('xarray', xarray.__version__, 'zarr', zarr.__version__, 'netCDF4', netCDF4.__version__)" \
+              || { echo "FAIL: 镜像缺 netCDF4，无法写 nc"; exit 1; }
+
+            echo "IN  = $IN"
+            echo "OUT = $OUT"
+            echo "SCRIPT sha256: $(sha256sum "$SCRIPT" | cut -d' ' -f1)"
+
+            rm -f "$OUT"
+            python3 "$SCRIPT" --input_path "$IN" --output_path "$OUT"
+            rc=$?
+            if [ "$rc" -eq 0 ] && [ -s "$OUT" ]; then
+              echo "OK $(date '+%F %T') -> $OUT ($(du -h "$OUT" | cut -f1))"
+            else
+              echo "FAIL rc=$rc $(date '+%F %T')"
+              exit 1
+            fi
+        resources: &resource_spec
+          limits: &limits_spec
+            cpu: "16"
+            memory: 256Gi
+          requests: *limits_spec
+        volumeMounts:
+        - mountPath: /workspace/
+          name: &pvc_name pvc-8xxpvc
+        - mountPath: /workspace/data
+          name: &data_name hostpath-8xcmad
+        - mountPath: /workspace/tmp
+          name: &tmp_name hostpath-8xcmat
+        - mountPath: /dev/shm
+          name: &shm_name shm-e3tzzc
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      volumes:
+      - name: *pvc_name
+        persistentVolumeClaim:
+          claimName: shenzw
+      - name: *data_name
+        hostPath:
+          path: /share/data
+          type: ""
+      - name: *tmp_name
+        hostPath:
+          path: /share/tmp
+          type: ""
+      - name: *shm_name
+        emptyDir:
+          medium: Memory
+          sizeLimit: 1024Gi

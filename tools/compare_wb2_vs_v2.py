@@ -48,6 +48,12 @@ TOL_CLOSE_REL = 0.010    # B 接近 ≤1%
 TOL_MINOR_REL = 0.030    # C 小差 ≤3%
 TOL_MAJOR_REL = 0.100    # D 大差 ≤10%，再大看趋势
 
+# Bias 是近零量，按自身相对差判会爆掉；改用 |Δbias|/RMSE（与下方阈值表一致）
+BIAS_PASS = 0.02
+BIAS_CLOSE = 0.05
+BIAS_MINOR = 0.10
+BIAS_MAJOR = 0.20
+
 # ACC 是无量纲、数值贴着 1，用绝对差判定
 ACC_ABS_PASS = 2e-3
 ACC_ABS_CLOSE = 5e-3
@@ -172,6 +178,7 @@ class PairResult:
     outliers: List[int] = field(default_factory=list)
     init_scatter_ratio: Optional[float] = None
     x_mean: Optional[np.ndarray] = None   # rmse 的 mean 聚合版本（供 T6）
+    bias_rel_max: Optional[float] = None  # max|Δbias|/RMSE（bias 专用判定）
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -274,7 +281,9 @@ def load_wb2_deterministic(path: Path) -> Tuple[Dict[Tuple[str, str], Dict[int, 
             print(f"[skip] 未知变量 token: {m.group('tok')}")
             continue
 
-        ds = xr.open_dataset(f)
+        # 新版 xarray 不接受 lead_time 上残留的 dtype 属性（WB2 文件里带着
+        # dtype=timedelta64[s]）；关掉时间解码，raw 值是 int64 小时数，够用。
+        ds = xr.open_dataset(f, decode_times=False, decode_timedelta=False)
         try:
             names = list(ds.data_vars)
             if not names:
@@ -382,12 +391,25 @@ def _verdict(abs_metric: bool, rel_max: float, abs_max: float,
     return "MISMATCH"
 
 
+def _verdict_bias(value: float, pearson: float) -> str:
+    """Bias 专用：按 |Δbias|/RMSE 分档。"""
+    limits = (BIAS_PASS, BIAS_CLOSE, BIAS_MINOR, BIAS_MAJOR)
+    for limit, tier in zip(limits, ("PASS", "CLOSE", "MINOR", "MAJOR")):
+        if value <= limit:
+            return tier
+    if math.isfinite(pearson) and pearson >= 0.999:
+        return "SHAPE"
+    return "MISMATCH"
+
+
 def compare_pair(var: str, label: str,
                  v2_metric: str, wb2_metric: str,
                  x_map: Dict[int, float], y_map: Dict[int, float],
                  *, abs_metric: bool, note: str,
                  init_std: Optional[Dict[int, float]] = None,
-                 x_mean_map: Optional[Dict[int, float]] = None) -> Optional[PairResult]:
+                 x_mean_map: Optional[Dict[int, float]] = None,
+                 normalize_by: Optional[Dict[int, float]] = None,
+                 scale_override: Optional[float] = None) -> Optional[PairResult]:
     leads = sorted(set(x_map) & set(y_map))
     if len(leads) < 2:
         return None
@@ -418,6 +440,9 @@ def compare_pair(var: str, label: str,
             scale, scale_kind = 1.0 / ratio_median, "unit"
         elif ratio_cv <= 0.01 and abs(ratio_median - 1.0) > 0.01:
             scale, scale_kind = 1.0 / ratio_median, "approx"
+    if scale_override is not None:
+        # Bias 的比值在近零处噪声大，量纲换算沿用同变量 RMSE 的判定
+        scale = float(scale_override)
 
     # T2 逐时效差
     abs_diff = x * scale - y
@@ -427,6 +452,16 @@ def compare_pair(var: str, label: str,
     rel_max = float(np.max(np.abs(rel[fine]))) if fine.any() else float("nan")
     rel_median = float(np.median(np.abs(rel[fine]))) if fine.any() else float("nan")
     abs_max = float(np.max(np.abs(abs_diff))) if abs_diff.size else float("nan")
+
+    # Bias 专用：|Δbias| 相对 WB2 RMSE 归一后的最大值
+    bias_rel_max = None
+    if normalize_by is not None:
+        denom = np.array([normalize_by.get(l, np.nan) for l in leads], dtype=float)
+        valid = np.isfinite(denom) & (denom > 0)
+        if valid.any():
+            bias_rel_max = float(
+                np.max(np.abs(x[valid] * scale - y[valid]) / denom[valid])
+            )
 
     # 异常时效：|相对差| 超过中位的 OUTLIER_FACTOR 倍且 >1%
     outliers: List[int] = []
@@ -454,8 +489,13 @@ def compare_pair(var: str, label: str,
         if stds.size and np.median(stds) > 0:
             scatter_ratio = float(np.median(deltas) / np.median(stds))
 
-    verdict = _verdict(abs_metric, rel_max, abs_max, pearson, scale_kind)
+    if bias_rel_max is not None:
+        verdict = _verdict_bias(bias_rel_max, pearson)
+    else:
+        verdict = _verdict(abs_metric, rel_max, abs_max, pearson, scale_kind)
     note_parts = [note]
+    if bias_rel_max is not None:
+        note_parts.append(f"max|Δbias|/RMSE={bias_rel_max:.4f}（判定依据）")
     if scale_kind in {"unit", "approx"}:
         tag = "精确" if scale_kind == "unit" else "近似"
         note_parts.append(f"{tag}倍率 {ratio_median:.6g}×（v2/WB2）")
@@ -480,6 +520,7 @@ def compare_pair(var: str, label: str,
         slope=slope, intercept=intercept,
         verdict=verdict, note="；".join(note_parts),
         outliers=outliers, init_scatter_ratio=scatter_ratio, x_mean=x_mean,
+        bias_rel_max=bias_rel_max,
     )
 
 
@@ -513,8 +554,13 @@ def build_pairs(v2: Dict, det: Dict, extra: Dict) -> List[PairResult]:
 
         if "bias" in mets and (var, "bias") in det:
             x_map = {l: a.mean for l, a in mets["bias"].items()}
+            # 量纲换算沿用同变量 RMSE 的倍率（bias 自身比值在近零处不可靠）
+            rmse_pair = next(
+                (p for p in results if p.var == var and p.label == "RMSE"), None)
             r = compare_pair(var, "Bias", "bias", "bias", x_map, det[(var, "bias")],
-                             abs_metric=False, note="逐格平均偏差")
+                             abs_metric=False, note="逐格平均偏差；判定用 |Δbias|/RMSE",
+                             normalize_by=det.get((var, "rmse")),
+                             scale_override=rmse_pair.scale if rmse_pair else None)
             if r:
                 results.append(r)
 
@@ -694,7 +740,10 @@ def write_report(path: Path, *, v2_meta: Dict, wb2_meta: Dict,
         for r in sorted(results, key=lambda z: (z.var, z.label)):
             rows.append([
                 r.var, LABEL_CN.get(r.label, r.label), str(r.n),
-                _f(r.ratio_median), _pct(r.rel_max), _f(r.abs_max, 3),
+                _f(r.ratio_median),
+                (f"{r.bias_rel_max:.4f}（|Δb|/RMSE）"
+                 if r.bias_rel_max is not None else _pct(r.rel_max)),
+                _f(r.abs_max, 3),
                 _f(r.pearson, 5), _f(r.spearman, 4),
                 f"**{VERDICT_CN.get(r.verdict, r.verdict)}**", r.note,
             ])
@@ -915,9 +964,9 @@ def write_report(path: Path, *, v2_meta: Dict, wb2_meta: Dict,
         "- **起报窗**：v2 配置里写的是 2022 全年；WB2 的最后一个起报是 "
         "2022-12-16T12（+360h 落在 12-31，仍在 2022 真值内），评测的有效时间覆盖全年。"
         "若 v2 的 inference_raw 也止于 12-16，两边样本一致。",
-        "- **仅一边有的产物**：v2 的谱 / 球谐带在 WB2 侧没有对应指标；"
-        "WB2 的 `bias`/`mae`/`csi`/`frequency_bias`/`fss`/`relative_intensity` "
-        "在本批 v2 产物中要么未产出、要么没有 tp，故不参与对表。",
+        "- **Bias**：v2 的 bias 是逐格平均偏差（forecast−obs 的网格均值），"
+        "与 WB2 的 `bias` 同义。bias 本身接近 0，相对差会爆掉，故判定统一用 "
+        "`max|Δbias|/RMSE`（阈值见上方表），量纲换算沿用同变量 RMSE 的倍率。",
         "- **FSS 特别说明**：即使补上 tp，v2 的 FSS（等权、无经度环绕、窗口不含 9px）"
         "与 WB2（面积加权、经度环绕、9px）也不是同一口径，不能直接对表。",
         "",
@@ -985,8 +1034,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for r in sorted(results, key=lambda z: (z.var, z.label)):
             label = LABEL_CN.get(r.label, r.label)
             verdict = VERDICT_CN.get(r.verdict, r.verdict)
+            if r.bias_rel_max is not None:
+                metric = f"max|Δb|/RMSE={r.bias_rel_max:.4f}"
+            else:
+                metric = f"max|Δ|={r.rel_max*100:.3f}%"
             print(f"  {r.var:6s} {label:12s} {verdict:8s} "
-                  f"max|Δ|={r.rel_max*100:.3f}%  r={r.pearson:.5f}")
+                  f"{metric}  r={r.pearson:.5f}")
     return 0
 
 

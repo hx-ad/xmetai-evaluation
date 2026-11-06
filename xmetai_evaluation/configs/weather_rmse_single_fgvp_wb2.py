@@ -62,11 +62,15 @@ cfg = EvalConfig(
         "path": "/workspace/data/zarr_refresh_v3/era5.1979_2024.c78.p25.h6.v1",
         "variables": VARS,
     },
-    # smooth_days=15：±7.5 天中心滑动（跨年首尾相接）
+    # 气候态用 WB2 的 era5_1990_2020_6h_mean 转出来的 nc（11 变量），
+    # 源 zarr 已按 dayofyear 做过 61 天线性平滑，所以 smooth_days 必须为 0；
+    # 若用 15，reader 会沿 6h 交错时间轴再滑 61 步，把日循环抹掉。
     reference_reader={
         "type": "daily_climatology",
-        "root_dir": os.environ.get("ERA5_CLIMO", "/workspace/data/worm/era5_clim_phys_14.nc"),
-        "smooth_days": 15,  # ±7.5 天中心滑动、跨年首尾相接，抹平单日气候态噪声
+        "root_dir": os.environ.get(
+            "ERA5_CLIMO", "/workspace/data/shenzw/wb2/eval_clim/era5_clim_phys_wb2.nc"
+        ),
+        "smooth_days": 0,
     },
 
     # ── 时段 ──
